@@ -50,6 +50,10 @@
 #include <termios.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <netinet/tcp.h>
+#include <netdb.h>
 
 #include <nfc/nfc.h>
 #include "nfc-internal.h"
@@ -95,6 +99,10 @@ const char *serial_ports_device_radix[] = { "ttyUSB", "ttyS", "ttyACM", "ttyAMA"
 // Work-around to claim uart interface using the c_iflag (software input processing) from the termios struct
 #  define CCLAIMED 0x80000000
 
+#ifndef SOL_TCP
+# define SOL_TCP IPPROTO_TCP
+#endif
+
 struct serial_port_unix {
   int 			fd; 			// Serial port file descriptor
   struct termios 	termios_backup; 	// Terminal info before using the port
@@ -112,6 +120,117 @@ uart_open(const char *pcPortName)
 
   if (sp == 0)
     return INVALID_SERIAL_PORT;
+
+  if (memcmp(pcPortName, "tcp_", 4) == 0) {
+        struct addrinfo *addr = NULL, *rp;
+        char *addrstr = strdup(pcPortName + 4);
+
+        if (addrstr == NULL) {
+            printf("Error: strdup\n");
+            free(sp);
+            return INVALID_SERIAL_PORT;
+        }
+
+        char *colon = strrchr(addrstr, '_');
+        const char *portstr;
+        if (colon) {
+            portstr = colon + 1;
+            *colon = '\0';
+        } else {
+            portstr = "7901";
+        }
+
+        struct addrinfo info;
+
+        memset(&info, 0, sizeof(info));
+
+        info.ai_socktype = SOCK_STREAM;
+
+        int s = getaddrinfo(addrstr, portstr, &info, &addr);
+        if (s != 0) {
+            printf("Error: getaddrinfo: %s\n", gai_strerror(s));
+            freeaddrinfo(addr);
+            free(addrstr);
+            free(sp);
+            return INVALID_SERIAL_PORT;
+        }
+
+        int sfd;
+        for (rp = addr; rp != NULL; rp = rp->ai_next) {
+            sfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+
+            if (sfd == -1)
+                continue;
+
+            if (connect(sfd, rp->ai_addr, rp->ai_addrlen) != -1)
+                break;
+
+            close(sfd);
+        }
+
+        if (rp == NULL) {               /* No address succeeded */
+            printf("Error: Could not connect\n");
+            freeaddrinfo(addr);
+            free(addrstr);
+            free(sp);
+            return INVALID_SERIAL_PORT;
+        }
+
+        freeaddrinfo(addr);
+        free(addrstr);
+
+        sp->fd = sfd;
+
+        int one = 1;
+        int res = setsockopt(sp->fd, SOL_TCP, TCP_NODELAY, &one, sizeof(one));
+        if (res != 0) {
+            free(sp);
+            return INVALID_SERIAL_PORT;
+        }
+        return sp;
+  }
+
+    // The socket for abstract namespace implement.
+    // Is local socket buffer, not a TCP or any net connection!
+    // so, you can't connect with address like: 127.0.0.1, or any IP
+    // see http://man7.org/linux/man-pages/man7/unix.7.html
+  if (memcmp(pcPortName, "socket_", 7) == 0) {
+        if (strlen(pcPortName) <= 7) {
+            free(sp);
+            return INVALID_SERIAL_PORT;
+        }
+
+        size_t servernameLen = (strlen(pcPortName) - 7) + 1;
+        char serverNameBuf[servernameLen];
+        memset(serverNameBuf, '\0', servernameLen);
+        for (int i = 7, j = 0; j < servernameLen; ++i, ++j) {
+            serverNameBuf[j] = pcPortName[i];
+        }
+        serverNameBuf[servernameLen - 1] = '\0';
+
+        int localsocket, len;
+        struct sockaddr_un remote;
+
+        remote.sun_path[0] = '\0';  // abstract namespace
+        strcpy(remote.sun_path + 1, serverNameBuf);
+        remote.sun_family = AF_LOCAL;
+        int nameLen = strlen(serverNameBuf);
+        len = 1 + nameLen + offsetof(struct sockaddr_un, sun_path);
+
+        if ((localsocket = socket(PF_LOCAL, SOCK_STREAM, 0)) == -1) {
+            free(sp);
+            return INVALID_SERIAL_PORT;
+        }
+
+        if (connect(localsocket, (struct sockaddr *) &remote, len) == -1) {
+            free(sp);
+            return INVALID_SERIAL_PORT;
+        }
+
+        sp->fd = localsocket;
+
+        return sp;
+  }
 
   sp->fd = open(pcPortName, O_RDWR | O_NOCTTY | O_NONBLOCK);
   if (sp->fd == -1) {
